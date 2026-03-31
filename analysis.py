@@ -97,5 +97,3 @@ print(segment_analysis)
 # 8. 保存结果
 segment_analysis.to_csv('outputs/segment_analysis.csv')
 user_data.to_csv('outputs/user_analysis.csv', index=False)
-
-print("\n分析完成，结果已保存到outputs目录")
