@@ -1,71 +1,60 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
-from math import sqrt
 
 class ABTest:
     """A/B测试框架"""
     
     def __init__(self, data):
-        self.data = data
+        self.data = data.copy()
+        self.test_results = None
     
-    def calculate_sample_size(self, baseline_conversion, minimum_detectable_effect, 
-                           significance_level=0.05, power=0.8):
-        """计算所需样本量"""
-        # 计算样本量
-        z_alpha = stats.norm.ppf(1 - significance_level / 2)
-        z_beta = stats.norm.ppf(power)
+    def randomize_users(self, test_size=0.5, seed=42):
+        """随机分配用户到测试组和对照组"""
+        np.random.seed(seed)
         
-        p1 = baseline_conversion
-        p2 = p1 * (1 + minimum_detectable_effect)
-        p = (p1 + p2) / 2
+        # 确保test_group列存在
+        if 'test_group' not in self.data.columns:
+            self.data['test_group'] = None
         
-        sample_size = (z_alpha * sqrt(2 * p * (1 - p)) + z_beta * sqrt(p1 * (1 - p1) + p2 * (1 - p2))) ** 2 / (p2 - p1) ** 2
-        
-        return int(np.ceil(sample_size))
-    
-    def randomize_users(self, segment=None, test_group_size=0.5):
-        """随机分流用户"""
-        # 如果指定了分群，只对该分群用户进行分流
-        if segment:
-            target_users = self.data[self.data['combined_segment'] == segment]
-        else:
-            target_users = self.data
-        
-        # 随机分流
-        np.random.seed(42)
-        test_group = np.random.binomial(1, test_group_size, size=len(target_users))
-        
-        # 标记分组
-        target_users['test_group'] = test_group
-        target_users['test_group'] = target_users['test_group'].map({0: 'control', 1: 'treatment'})
-        
-        # 合并回原数据
-        self.data = self.data.merge(
-            target_users[['user_id', 'test_group']],
-            on='user_id',
-            how='left'
+        # 随机分配
+        n_users = len(self.data)
+        test_indices = np.random.choice(
+            self.data.index,
+            size=int(n_users * test_size),
+            replace=False
         )
         
-        # 未分配的用户标记为控制组
-        self.data['test_group'] = self.data['test_group'].fillna('control')
+        self.data.loc[test_indices, 'test_group'] = 'treatment'
+        self.data.loc[~self.data.index.isin(test_indices), 'test_group'] = 'control'
         
         return self.data
     
-    def generate_experiment_data(self, test_group_effect=0.15):
-        """生成实验结果数据"""
-        # 为测试组添加效果
-        self.data['conversion_probability'] = 0.05  # 基础转化率
-        self.data.loc[self.data['test_group'] == 'treatment', 'conversion_probability'] *= (1 + test_group_effect)
+    def simulate_experiment(self, test_group_effect=0.15, seed=42):
+        """模拟实验效果"""
+        np.random.seed(seed)
         
-        # 生成转化结果
-        np.random.seed(42)
-        self.data['converted'] = np.random.binomial(1, self.data['conversion_probability'])
+        # 确保已随机化
+        if 'test_group' not in self.data.columns or self.data['test_group'].isnull().any():
+            self.randomize_users()
         
-        # 生成保费数据
-        self.data['premium'] = np.where(
-            self.data['converted'],
-            np.random.uniform(1000, 5000, size=len(self.data)),
+        # 模拟转化率（基于续保率）
+        base_conversion_rate = self.data['renewal_rate'].mean()
+        
+        # 测试组提升效果
+        self.data['converted'] = np.random.binomial(
+            1,
+            np.where(
+                self.data['test_group'] == 'treatment',
+                base_conversion_rate * (1 + test_group_effect),
+                base_conversion_rate
+            )
+        )
+        
+        # 模拟收入
+        self.data['revenue'] = np.where(
+            self.data['converted'] == 1,
+            self.data['total_premium'] * np.random.uniform(0.8, 1.2, len(self.data)),
             0
         )
         
@@ -73,146 +62,125 @@ class ABTest:
     
     def analyze_results(self):
         """分析实验结果"""
-        # 按组统计
+        if 'converted' not in self.data.columns:
+            self.simulate_experiment()
+        
+        # 分组统计
         group_stats = self.data.groupby('test_group').agg({
             'user_id': 'count',
-            'converted': ['sum', 'mean'],
-            'premium': ['sum', 'mean']
-        }).round(4)
+            'converted': ['mean', 'sum', 'std'],
+            'revenue': ['mean', 'sum']
+        })
         
-        # 提取数据
-        control_size = group_stats.loc['control', ('user_id', 'count')]
-        treatment_size = group_stats.loc['treatment', ('user_id', 'count')]
+        # 计算转化率差异
+        control_conv = group_stats.loc['control', ('converted', 'mean')]
+        treatment_conv = group_stats.loc['treatment', ('converted', 'mean')]
+        conversion_diff = treatment_conv - control_conv
         
-        control_conversion = group_stats.loc['control', ('converted', 'mean')]
-        treatment_conversion = group_stats.loc['treatment', ('converted', 'mean')]
+        # 计算收入差异
+        control_rev = group_stats.loc['control', ('revenue', 'mean')]
+        treatment_rev = group_stats.loc['treatment', ('revenue', 'mean')]
+        revenue_diff = treatment_rev - control_rev
         
-        control_revenue = group_stats.loc['control', ('premium', 'sum')]
-        treatment_revenue = group_stats.loc['treatment', ('premium', 'sum')]
+        # 统计检验
+        control_converted = self.data[self.data['test_group'] == 'control']['converted']
+        treatment_converted = self.data[self.data['test_group'] == 'treatment']['converted']
         
-        # 计算差异
-        conversion_diff = treatment_conversion - control_conversion
-        revenue_diff = treatment_revenue - control_revenue
+        # Z检验
+        n1 = len(control_converted)
+        n2 = len(treatment_converted)
+        p1 = control_converted.mean()
+        p2 = treatment_converted.mean()
         
-        # 统计显著性检验
-        # 转化率检验（卡方检验）
-        control_converted = group_stats.loc['control', ('converted', 'sum')]
-        treatment_converted = group_stats.loc['treatment', ('converted', 'sum')]
-        
-        contingency_table = [[control_converted, control_size - control_converted],
-                           [treatment_converted, treatment_size - treatment_converted]]
-        
-        chi2, p_value_conversion, _, _ = stats.chi2_contingency(contingency_table)
-        
-        # 收入检验（t检验）
-        control_premiums = self.data[self.data['test_group'] == 'control']['premium']
-        treatment_premiums = self.data[self.data['test_group'] == 'treatment']['premium']
-        
-        t_stat, p_value_revenue = stats.ttest_ind(treatment_premiums, control_premiums)
+        pooled_p = (n1 * p1 + n2 * p2) / (n1 + n2)
+        se = np.sqrt(pooled_p * (1 - pooled_p) * (1/n1 + 1/n2))
+        z_score = (p2 - p1) / se
+        p_value = 2 * (1 - stats.norm.cdf(abs(z_score)))
         
         # 计算置信区间
-        conversion_se = sqrt(
-            control_conversion * (1 - control_conversion) / control_size +
-            treatment_conversion * (1 - treatment_conversion) / treatment_size
-        )
+        ci_lower = (p2 - p1) - 1.96 * se
+        ci_upper = (p2 - p1) + 1.96 * se
+        conversion_ci = f'[{ci_lower:.4f}, {ci_upper:.4f}]'
         
-        conversion_ci = (conversion_diff - 1.96 * conversion_se, 
-                        conversion_diff + 1.96 * conversion_se)
+        # 判断是否显著
+        is_significant = p_value < 0.05
         
-        # 计算效应量
-        pooled_p = (control_converted + treatment_converted) / (control_size + treatment_size)
-        effect_size = conversion_diff / sqrt(pooled_p * (1 - pooled_p))
-        
-        # 生成分析报告
         analysis = {
             'group_stats': group_stats,
             'conversion_diff': conversion_diff,
             'conversion_ci': conversion_ci,
             'revenue_diff': revenue_diff,
-            'p_value_conversion': p_value_conversion,
-            'p_value_revenue': p_value_revenue,
-            'effect_size': effect_size,
-            'is_significant': p_value_conversion < 0.05
+            'p_value_conversion': p_value,
+            'is_significant': is_significant
         }
         
         return analysis
     
     def generate_experiment_report(self, segment=None, test_group_effect=0.15):
         """生成实验报告"""
-        # 随机分流
-        self.randomize_users(segment)
+        # 选择数据
+        if segment:
+            experiment_data = self.data[self.data['combined_segment'] == segment].copy()
+        else:
+            experiment_data = self.data.copy()
         
-        # 生成实验数据
-        self.generate_experiment_data(test_group_effect)
-        
-        # 分析结果
-        analysis = self.analyze_results()
+        # 创建实验实例
+        ab_test = ABTest(experiment_data)
+        ab_test.randomize_users()
+        ab_test.simulate_experiment(test_group_effect=test_group_effect)
+        analysis = ab_test.analyze_results()
         
         # 生成报告
         report = {
-            'segment': segment or 'all_users',
-            'sample_size': len(self.data),
-            'test_group_size': len(self.data[self.data['test_group'] == 'treatment']),
-            'control_group_size': len(self.data[self.data['test_group'] == 'control']),
+            'segment': segment if segment else 'all_users',
+            'test_group_effect': test_group_effect,
             'analysis': analysis
         }
         
         return report
     
-    def run_power_analysis(self, baseline_conversion, effect_sizes):
-        """功效分析"""
-        results = []
+    def calculate_sample_size(self, baseline_rate, min_detectable_effect, alpha=0.05, power=0.8):
+        """计算所需样本量"""
+        # Z分数
+        z_alpha = stats.norm.ppf(1 - alpha/2)
+        z_beta = stats.norm.ppf(power)
         
-        for effect in effect_sizes:
-            sample_size = self.calculate_sample_size(baseline_conversion, effect)
-            results.append({
-                'effect_size': effect,
-                'sample_size': sample_size
-            })
+        # 效应量
+        p1 = baseline_rate
+        p2 = baseline_rate * (1 + min_detectable_effect)
         
-        return pd.DataFrame(results)
-
-if __name__ == '__main__':
-    from src.data.data_loader import DataLoader
-    from src.analysis.user_segmentation import UserSegmentation
+        # 样本量计算
+        pooled_p = (p1 + p2) / 2
+        n_per_group = (
+            (z_alpha + z_beta) ** 2 * 2 * pooled_p * (1 - pooled_p)
+        ) / ((p2 - p1) ** 2)
+        
+        return int(np.ceil(n_per_group))
     
-    # 加载数据
-    loader = DataLoader()
-    data = loader.create_etl_pipeline()
-    
-    # 分群
-    segmenter = UserSegmentation(data)
-    segmented_data = segmenter.create_combined_segment()
-    
-    # 运行A/B测试
-    ab_test = ABTest(segmented_data)
-    
-    # 计算样本量
-    sample_size = ab_test.calculate_sample_size(
-        baseline_conversion=0.05,
-        minimum_detectable_effect=0.15
-    )
-    print(f"所需样本量: {sample_size}")
-    
-    # 运行实验
-    report = ab_test.generate_experiment_report(
-        segment='高价值忠诚用户',
-        test_group_effect=0.15
-    )
-    
-    print("\n=== 实验报告 ===")
-    print(f"分群: {report['segment']}")
-    print(f"总样本量: {report['sample_size']}")
-    print(f"测试组样本量: {report['test_group_size']}")
-    print(f"控制组样本量: {report['control_group_size']}")
-    
-    print("\n分组统计:")
-    print(report['analysis']['group_stats'])
-    
-    print(f"\n转化率差异: {report['analysis']['conversion_diff']:.4f}")
-    print(f"95% 置信区间: {report['analysis']['conversion_ci']}")
-    print(f"收入差异: {report['analysis']['revenue_diff']:.2f}")
-    print(f"转化率p值: {report['analysis']['p_value_conversion']:.4f}")
-    print(f"收入p值: {report['analysis']['p_value_revenue']:.4f}")
-    print(f"效应量: {report['analysis']['effect_size']:.4f}")
-    print(f"是否显著: {report['analysis']['is_significant']}")
+    def check_srm(self, expected_ratio=0.5):
+        """检查样本比例不平衡"""
+        if 'test_group' not in self.data.columns:
+            return None
+        
+        n_total = len(self.data)
+        n_treatment = (self.data['test_group'] == 'treatment').sum()
+        observed_ratio = n_treatment / n_total
+        
+        # 卡方检验
+        expected_treatment = n_total * expected_ratio
+        expected_control = n_total * (1 - expected_ratio)
+        observed_treatment = n_treatment
+        observed_control = n_total - n_treatment
+        
+        chi2, p_value = stats.chisquare(
+            [observed_treatment, observed_control],
+            f_exp=[expected_treatment, expected_control]
+        )
+        
+        return {
+            'observed_ratio': observed_ratio,
+            'expected_ratio': expected_ratio,
+            'chi2': chi2,
+            'p_value': p_value,
+            'is_significant': p_value < 0.05
+        }
